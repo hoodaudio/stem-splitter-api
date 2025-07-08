@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: stem-splitter-api
+    env: python
+    buildCommand: |
+      pip install -r requirements.txt
+      # Download Spleeter models during build
+      python -c "from spleeter.separator import Separator; Separator('spleeter:4stems-waveform')"
+    startCommand: python app.py
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: PORT
+        value: 5000
+    autoDeploy: false
+    plan: starter
+    disk:
+      name: stem-splitter-disk
+      size: 1024
+      mount: /opt/render/project/src/storage
