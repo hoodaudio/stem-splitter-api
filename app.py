@@ -1,21 +1,16 @@
-# app.py - Flask app for Spleeter STEM splitting service
+# app.py - Flask app for Demucs STEM splitting service
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
 import tempfile
 import zipfile
-from spleeter.separator import Separator
-import librosa
-import soundfile as sf
+import subprocess
 import uuid
 from werkzeug.utils import secure_filename
 import shutil
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Squarespace integration
-
-# Initialize Spleeter separator
-separator = Separator('spleeter:4stems-waveform')
 
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'outputs'
@@ -164,46 +159,79 @@ def split_audio():
         job_output_dir = os.path.join(OUTPUT_FOLDER, job_id)
         os.makedirs(job_output_dir, exist_ok=True)
         
-        # Load and process audio
-        waveform, sample_rate = librosa.load(input_path, sr=None, mono=False)
+        # Run Demucs separation using subprocess
+        try:
+            # Use subprocess to run demucs
+            cmd = [
+                'python', '-m', 'demucs.separate',
+                '--two-stems=vocals',  # This separates into vocals and no_vocals
+                '--out', job_output_dir,
+                input_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+            
+            if result.returncode != 0:
+                return jsonify({'success': False, 'error': f'Demucs failed: {result.stderr}'})
+            
+            # For full 4-stem separation, use this command instead:
+            cmd_full = [
+                'python', '-m', 'demucs.separate',
+                '--out', job_output_dir,
+                input_path
+            ]
+            
+            result_full = subprocess.run(cmd_full, capture_output=True, text=True, timeout=300)
+            
+            if result_full.returncode != 0:
+                return jsonify({'success': False, 'error': f'Demucs full separation failed: {result_full.stderr}'})
+            
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'error': 'Processing timeout - file may be too large'})
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Subprocess error: {str(e)}'})
         
-        # Ensure stereo format for Spleeter
-        if waveform.ndim == 1:
-            waveform = waveform.reshape(1, -1)
-        if waveform.shape[0] == 1:
-            waveform = np.vstack([waveform, waveform])
+        # Find the separated files
+        # Demucs creates: job_output_dir/htdemucs/filename_without_ext/drums.wav, bass.wav, other.wav, vocals.wav
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        separated_dir = os.path.join(job_output_dir, 'htdemucs', base_name)
         
-        # Transpose to (time, channels) format expected by Spleeter
-        waveform = waveform.T
+        if not os.path.exists(separated_dir):
+            return jsonify({'success': False, 'error': f'Separation output not found at {separated_dir}'})
         
-        # Split into stems
-        stems = separator.separate(waveform)
-        
-        # Save stems as individual WAV files
-        stem_files = []
-        for stem_name, stem_audio in stems.items():
-            stem_filename = f"{stem_name}.wav"
-            stem_path = os.path.join(job_output_dir, stem_filename)
-            sf.write(stem_path, stem_audio, sample_rate)
-            stem_files.append(stem_path)
-        
-        # Create ZIP file
+        # Create ZIP file with stems
         zip_path = os.path.join(job_output_dir, f"stems_{job_id}.zip")
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            for stem_file in stem_files:
-                zipf.write(stem_file, os.path.basename(stem_file))
+        stem_files = []
+        
+        try:
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                for file_name in os.listdir(separated_dir):
+                    if file_name.endswith('.wav'):
+                        file_path = os.path.join(separated_dir, file_name)
+                        zipf.write(file_path, file_name)
+                        stem_files.append(file_name)
+            
+            if not stem_files:
+                return jsonify({'success': False, 'error': 'No stem files were created'})
+            
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Failed to create ZIP file: {str(e)}'})
         
         # Clean up input file
-        os.remove(input_path)
+        try:
+            os.remove(input_path)
+        except:
+            pass  # Don't fail if cleanup fails
         
         return jsonify({
             'success': True,
             'job_id': job_id,
-            'message': 'Audio successfully split into stems'
+            'message': 'Audio successfully split into stems',
+            'stems_created': stem_files
         })
         
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': f'Unexpected error: {str(e)}'})
 
 @app.route('/download/<job_id>')
 def download_result(job_id):
